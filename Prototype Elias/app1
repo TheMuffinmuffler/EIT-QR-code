@@ -1,0 +1,319 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import sqlite3
+from datetime import datetime, timedelta
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
+from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib import fonts
+from reportlab.lib.units import inch
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
+from reportlab.platypus import TableStyle
+import os
+import subprocess
+
+DB_NAME = "inventory.db"
+
+# ---------------- DATABASE ----------------
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gtin TEXT,
+            name TEXT,
+            expiration_date TEXT,
+            registered_date TEXT,
+            quantity INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# ---------------- DATE HANDLING ----------------
+
+def parse_date(date_string):
+    try:
+        return datetime.strptime(date_string, "%d.%m.%Y").strftime("%Y-%m-%d")
+    except:
+        return None
+
+def format_date(date_string):
+    try:
+        return datetime.strptime(date_string, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except:
+        return ""
+
+# ---------------- REPORT FUNCTION ----------------
+
+def print_expiring_tomorrow():
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT name, gtin, expiration_date, quantity
+        FROM products
+        WHERE expiration_date=?
+    """, (tomorrow,))
+    results = cursor.fetchall()
+    conn.close()
+
+    if not results:
+        messagebox.showinfo("Report", "No products expiring tomorrow.")
+        return
+
+    filename = "Expiring_Tomorrow_Report.pdf"
+    doc = SimpleDocTemplate(filename)
+
+    elements = []
+
+    data = [["Product Name", "GTIN", "Expiration", "Quantity"]]
+
+    for row in results:
+        data.append([
+            row[0],
+            row[1],
+            format_date(row[2]),
+            str(row[3])
+        ])
+
+    table = Table(data, colWidths=[2.5*inch, 2*inch, 1.5*inch, 1*inch])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('BACKGROUND', (0,1), (-1,-1), colors.beige),
+    ]))
+
+    elements.append(table)
+    doc.build(elements)
+
+    subprocess.Popen([filename], shell=True)
+
+# ---------------- DATABASE ACTIONS ----------------
+
+def add_stock(gtin, name, expiration_input, quantity):
+    expiration_db = parse_date(expiration_input)
+    if expiration_input and not expiration_db:
+        messagebox.showerror("Error", "Date must be DD.MM.YYYY")
+        return
+
+    registered = datetime.now().strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id FROM products
+        WHERE gtin=? AND expiration_date=?
+    """, (gtin, expiration_db))
+
+    existing = cursor.fetchone()
+
+    if existing:
+        cursor.execute("""
+            UPDATE products
+            SET quantity = quantity + ?
+            WHERE id=?
+        """, (quantity, existing[0]))
+    else:
+        cursor.execute("""
+            INSERT INTO products (gtin, name, expiration_date, registered_date, quantity)
+            VALUES (?, ?, ?, ?, ?)
+        """, (gtin, name, expiration_db, registered, quantity))
+
+    conn.commit()
+    conn.close()
+    refresh_table()
+
+def remove_stock(gtin):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, quantity FROM products
+        WHERE gtin=?
+        ORDER BY expiration_date ASC
+    """, (gtin,))
+    result = cursor.fetchone()
+
+    if result:
+        product_id, quantity = result
+        if quantity > 1:
+            cursor.execute("UPDATE products SET quantity=? WHERE id=?",
+                           (quantity - 1, product_id))
+        else:
+            cursor.execute("DELETE FROM products WHERE id=?", (product_id,))
+        conn.commit()
+    else:
+        messagebox.showwarning("Warning", "Product not found")
+
+    conn.close()
+    refresh_table()
+
+def delete_selected():
+    selected = tree.selection()
+    if not selected:
+        return
+
+    item = tree.item(selected[0])
+    product_id = item["values"][0]
+
+    if messagebox.askyesno("Confirm", "Delete this product completely?"):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM products WHERE id=?", (product_id,))
+        conn.commit()
+        conn.close()
+        refresh_table()
+
+def adjust_quantity():
+    selected = tree.selection()
+    if not selected:
+        return
+
+    item = tree.item(selected[0])
+    product_id = item["values"][0]
+
+    new_qty = simpledialog.askinteger("Adjust Quantity",
+                                      "Enter new quantity:")
+    if new_qty is None:
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE products SET quantity=? WHERE id=?",
+                   (new_qty, product_id))
+    conn.commit()
+    conn.close()
+    refresh_table()
+
+# ---------------- SCAN ----------------
+
+current_mode = "IN"
+
+def on_scan(event):
+    gtin = scan_entry.get().strip()
+    if not gtin:
+        return
+
+    if current_mode == "IN":
+        name = simpledialog.askstring("Product Name", "Enter product name:")
+        if not name:
+            return
+
+        expiration = simpledialog.askstring("Expiration",
+                                            "Enter expiration (DD.MM.YYYY):")
+        quantity = simpledialog.askinteger("Quantity",
+                                           "Enter quantity:")
+        if quantity:
+            add_stock(gtin, name, expiration, quantity)
+    else:
+        remove_stock(gtin)
+
+    scan_entry.delete(0, tk.END)
+
+def set_mode(mode):
+    global current_mode
+    current_mode = mode
+
+    if mode == "IN":
+        mode_label.config(text="Mode: Register Products (IN)",
+                          fg="#00aa55")
+    else:
+        mode_label.config(text="Mode: Products Going Out (OUT)",
+                          fg="#cc4444")
+
+# ---------------- TABLE ----------------
+
+def refresh_table():
+    for row in tree.get_children():
+        tree.delete(row)
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products")
+
+    for row in cursor.fetchall():
+        formatted = list(row)
+        formatted[3] = format_date(row[3])
+        formatted[4] = format_date(row[4])
+        tree.insert("", "end", values=formatted)
+
+    conn.close()
+
+# ---------------- UI ----------------
+
+init_db()
+
+root = tk.Tk()
+root.title("Store Inventory System")
+root.geometry("1200x650")
+root.configure(bg="#1e1e1e")
+
+style = ttk.Style()
+style.theme_use("clam")
+
+top_frame = tk.Frame(root, bg="#1e1e1e", pady=10)
+top_frame.pack(fill="x")
+
+tk.Button(top_frame, text="Register Products (IN)",
+          command=lambda: set_mode("IN"),
+          bg="#00aa55", fg="white").pack(side="left", padx=10)
+
+tk.Button(top_frame, text="Products Going Out (OUT)",
+          command=lambda: set_mode("OUT"),
+          bg="#cc4444", fg="white").pack(side="left")
+
+tk.Button(top_frame, text="Print Expiring Tomorrow",
+          command=print_expiring_tomorrow,
+          bg="#ffaa00", fg="black").pack(side="right", padx=10)
+
+mode_label = tk.Label(top_frame,
+                      text="Mode: Register Products (IN)",
+                      fg="#00aa55",
+                      bg="#1e1e1e")
+mode_label.pack(side="right", padx=20)
+
+left_frame = tk.Frame(root, bg="#1e1e1e", padx=30, pady=30)
+left_frame.pack(side="left", fill="y")
+
+scan_entry = tk.Entry(left_frame,
+                      font=("Segoe UI", 16),
+                      bg="#2d2d2d",
+                      fg="white",
+                      insertbackground="white",
+                      width=20)
+scan_entry.pack(pady=10)
+scan_entry.focus()
+scan_entry.bind("<Return>", on_scan)
+
+right_frame = tk.Frame(root, bg="#1e1e1e")
+right_frame.pack(side="right", fill="both", expand=True, padx=20, pady=20)
+
+columns = ("ID", "GTIN", "Name", "Expiration", "Registered", "Quantity")
+tree = ttk.Treeview(right_frame, columns=columns, show="headings")
+
+for col in columns:
+    tree.heading(col, text=col)
+    tree.column(col, anchor="center")
+
+tree.pack(fill="both", expand=True)
+
+button_frame = tk.Frame(right_frame, bg="#1e1e1e")
+button_frame.pack(fill="x", pady=10)
+
+tk.Button(button_frame, text="Adjust Quantity",
+          command=adjust_quantity,
+          bg="#007acc", fg="white").pack(side="left", padx=5)
+
+tk.Button(button_frame, text="Delete Product",
+          command=delete_selected,
+          bg="#aa0000", fg="white").pack(side="left")
+
+refresh_table()
+root.mainloop()
